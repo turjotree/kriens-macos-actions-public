@@ -1,0 +1,177 @@
+name: macOS Public noVNC Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: How long to keep the interactive Mac available
+        required: true
+        default: "30"
+        type: choice
+        options:
+          - "15"
+          - "30"
+          - "45"
+          - "60"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kriens-macos-public-novnc
+  cancel-in-progress: true
+
+jobs:
+  interactive:
+    name: Build, launch and expose Kriens on macOS
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      VITE_SUPABASE_URL: https://mhlqaabhzrounszunitq.supabase.co
+      VITE_SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1obHFhYWJoenJvdW5zenVuaXRxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkyOTc4NDEsImV4cCI6MjA5NDg3Mzg0MX0.lz6sa6-L6lE0h9OqklT845xIG6SjXh-w4Y2Ci4rREqQ
+      VITE_TURNSTILE_SITE_KEY: 0x4AAAAAAEaGQ96MJWHIT0Ar
+      VITE_PORTAL_CALLS_URL: https://turya-portal-calls-production.turjo75769.workers.dev
+
+    steps:
+      - name: Validate private inputs
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ secrets.KRIENS_SOURCE_TOKEN }}
+          NOVNC_PASSWORD: ${{ secrets.NOVNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SOURCE_TOKEN" ]] || { echo "KRIENS_SOURCE_TOKEN is not configured." >&2; exit 1; }
+          [[ ${#NOVNC_PASSWORD} -ge 10 ]] || { echo "NOVNC_PASSWORD must be at least 10 characters." >&2; exit 1; }
+
+      - name: Check out private Kriens source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: turjotree/turya-mukherjee-portfolio
+          ref: codex/macos-novnc-test
+          token: ${{ secrets.KRIENS_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: kriens
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.19.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.14.0"
+          cache: pnpm
+          cache-dependency-path: kriens/pnpm-lock.yaml
+
+      - name: Install, verify and build Kriens
+        working-directory: kriens
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --prefer-offline --frozen-lockfile
+          pnpm --dir src/desktop check
+          pnpm --dir src/desktop build
+          pnpm --dir src/desktop exec electron-builder --mac dir --config electron-builder.macos-test.cjs
+          app_path="$(find src/desktop/release-macos-test -maxdepth 3 -type d -name 'Kriens Connect & Work.app' -print -quit)"
+          [[ -n "$app_path" ]] || { echo "Kriens app was not produced." >&2; exit 1; }
+          xattr -cr "$app_path" || true
+          echo "KRIENS_APP_PATH=$PWD/$app_path" >> "$GITHUB_ENV"
+
+      - name: Enable interactive macOS desktop
+        shell: bash
+        env:
+          NOVNC_PASSWORD: ${{ secrets.NOVNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          remote_user="kriensvnc"
+          ard_exec="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent"
+          kickstart="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          tcc_db="/Library/Application Support/com.apple.TCC/TCC.db"
+          now="$(date +%s)"
+
+          for service in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent; do
+            sudo sqlite3 "$tcc_db" "INSERT OR REPLACE INTO access VALUES('$service','$ard_exec',1,2,0,1,NULL,NULL,NULL,'UNUSED',NULL,0,$now,NULL,NULL,'UNUSED',$now);"
+          done
+
+          approvals_plist="$HOME/Library/Group Containers/group.com.apple.replayd/ScreenCaptureApprovals.plist"
+          mkdir -p "$(dirname "$approvals_plist")"
+          defaults write "$approvals_plist" "$ard_exec" -date "3024-01-01 00:00:00 +0000" || true
+          killall cfprefsd 2>/dev/null || true
+          sudo killall tccd 2>/dev/null || true
+          killall replayd 2>/dev/null || true
+          sleep 2
+
+          sudo sysadminctl -addUser "$remote_user" -fullName "Kriens VNC" -password "$NOVNC_PASSWORD"
+          sudo "$kickstart" -activate -configure -access -on -users "$remote_user" -privs -all -restart -agent -menu
+
+          for attempt in {1..30}; do
+            if nc -z 127.0.0.1 5900; then break; fi
+            sleep 1
+          done
+          nc -z 127.0.0.1 5900
+          echo "VNC_USERNAME=$remote_user" >> "$GITHUB_ENV"
+
+      - name: Start noVNC browser tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.6.0 https://github.com/novnc/noVNC.git "$RUNNER_TEMP/noVNC"
+          git clone --depth 1 --branch v0.13.0 https://github.com/novnc/websockify.git "$RUNNER_TEMP/noVNC/utils/websockify"
+          nohup "$RUNNER_TEMP/noVNC/utils/novnc_proxy" --vnc 127.0.0.1:5900 --listen 127.0.0.1:6080 > "$RUNNER_TEMP/novnc.log" 2>&1 &
+
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null
+
+          command -v cloudflared >/dev/null || brew install cloudflared
+          nohup cloudflared tunnel --url http://127.0.0.1:6080 --no-autoupdate > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
+          tunnel_url=""
+          for attempt in {1..60}; do
+            tunnel_url="$(grep -Eo 'https://[A-Za-z0-9-]+\.trycloudflare\.com' "$RUNNER_TEMP/cloudflared.log" | tail -n 1 || true)"
+            if [[ -n "$tunnel_url" ]]; then break; fi
+            sleep 1
+          done
+          [[ -n "$tunnel_url" ]] || { cat "$RUNNER_TEMP/cloudflared.log" >&2; exit 1; }
+
+          novnc_url="$tunnel_url/vnc.html?autoconnect=true&resize=remote"
+          echo "NOVNC_URL=$novnc_url" >> "$GITHUB_ENV"
+          {
+            echo "## Kriens macOS interactive session"
+            echo ""
+            echo "**Open:** $novnc_url"
+            echo ""
+            echo "**Username:** \`$VNC_USERNAME\`"
+            echo ""
+            echo "Use the private value stored in the \`NOVNC_PASSWORD\` repository secret."
+            echo ""
+            echo "The password is intentionally never printed in this public workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Kriens macOS noVNC::$novnc_url"
+
+      - name: Launch Kriens and keep session alive
+        shell: bash
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          set -euo pipefail
+          case "$SESSION_MINUTES" in
+            15|30|45|60) ;;
+            *) echo "Invalid session duration: $SESSION_MINUTES" >&2; exit 1 ;;
+          esac
+
+          open "$KRIENS_APP_PATH"
+          for attempt in {1..30}; do
+            if pgrep -f 'Kriens Connect & Work' >/dev/null; then break; fi
+            sleep 1
+          done
+          pgrep -fl 'Kriens Connect & Work'
+          echo "The session is live at $NOVNC_URL for $SESSION_MINUTES minutes."
+
+          for ((minute=1; minute<=SESSION_MINUTES; minute++)); do
+            pgrep -f 'Kriens Connect & Work' >/dev/null || open "$KRIENS_APP_PATH" || true
+            sleep 60
+          done
