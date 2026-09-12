@@ -1,6 +1,9 @@
 name: macOS Public noVNC Test
 
 on:
+  push:
+    branches:
+      - session-start
   workflow_dispatch:
     inputs:
       session_minutes:
@@ -155,7 +158,7 @@ jobs:
       - name: Launch Kriens and keep session alive
         shell: bash
         env:
-          SESSION_MINUTES: ${{ inputs.session_minutes }}
+          SESSION_MINUTES: ${{ inputs.session_minutes || '15' }}
         run: |
           set -euo pipefail
           case "$SESSION_MINUTES" in
